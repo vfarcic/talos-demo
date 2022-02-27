@@ -1,0 +1,5 @@
+/creds
+/controlplane.yaml
+/kubeconfig.yaml
+/talosconfig
+/worker.yaml
