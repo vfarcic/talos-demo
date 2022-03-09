@@ -47,13 +47,28 @@ gzip disk.raw
 
 rm disk.raw.gz
 
-# We don't support the format of your image. Please try again with a supported image format (raw, qcow2, vdi, vhdx, or vmdk).
+# now upload the image
+# you have to do it manually through the browser
+# and make it public
+
+
+#create the image
+
+# Replace `[...]` with the region
+export REGION=[...]
+doctl compute image create \
+    --region $REGION \
+    --image-description talos-digital-ocean-tutorial \
+    --image-url https://talos-tutorial.$REGION.digitaloceanspaces.com/disk.raw.gz \
+    Talos
 
 # Replace `[...]` with the image ID
 export IMAGE_ID=[...]
 
+
+# Create the load balancer
 doctl compute load-balancer create \
-    --region nyc3 \
+    --region $REGION \
     --name talos-demo \
     --tag-name talos-demo \
     --health-check protocol:tcp,port:6443,check_interval_seconds:10,response_timeout_seconds:5,healthy_threshold:5,unhealthy_threshold:3 \
@@ -70,6 +85,8 @@ echo $LB_IP
 
 # Repeat the previous two commands if the output is empty (the LB has not yet been created)
 
+# Although SSH is not used by Talos, DigitalOcean still requires that an SSH key be associated with the droplet. 
+# Create a dummy key that can be used to satisfy this requirement.
 # Replace `[...]` with the public key
 doctl compute ssh-key create devops-toolkit --public-key [...]
 
@@ -107,8 +124,11 @@ export SSH_KEY_FINGERPRINT=[...]
 # - QEMU
 # - VirtualBox
 
-# TODO: Prerequisite setup explanation
-
+# Using the DNS name of the loadbalancer created earlier, generate the base configuration files for the Talos machines:
+# This step generates three files which are used to configure the the k8s nodes
+# The Controlplane Machine Config describes the configuration of a Talos server on which the Kubernetes Controlplane should run. 
+# The Worker Machine Config describes workload servers.
+# The talosconfig file is your local client configuration file
 talosctl gen config talos-demo https://$LB_IP:443
 
 # TODO: Cluster API video
@@ -119,167 +139,112 @@ cat worker.yaml
 
 cat talosconfig
 
+# Select the droplet size for control plan and workers
+
+export CTRL_SIZE=[...]
+export WORKER_SIZE=[...]
+
 for N in 1 2 3
 do
     doctl compute droplet create \
-        --region nyc3 \
+        --region $REGION \
         --image $IMAGE_ID \
-        --size s-2vcpu-4gb \
+        --size $CTRL_SIZE \
         --enable-private-networking \
-        --tag-names talos-demo-cp \
+        --tag-names talos-demo \
         --user-data-file controlplane.yaml \
         --ssh-keys $SSH_KEY_FINGERPRINT \
         talos-demo-cp-$N
 
     doctl compute droplet create \
-        --region nyc3 \
+        --region $REGION \
         --image $IMAGE_ID \
-        --size s-2vcpu-4gb \
+        --size $WORKER_SIZE \
         --enable-private-networking \
-        --tag-names talos-demo-worker \
         --user-data-file worker.yaml \
         --ssh-keys $SSH_KEY_FINGERPRINT \
         talos-demo-worker-$N
 done
 
-export CP_1_IP=$(doctl compute droplet get \
-    --format PublicIPv4 \
-    talos-demo-cp-1 \
-    | tail -1)
+# Bootstrap Etcd
+# To configure talosctl we will need the control planes IP:
+for N in 1 2 3
+do
+    export CP_IP_$N=$(doctl compute droplet get \
+        --format PublicIPv4 \
+        talos-demo-cp-$N \
+        | tail -1)
+    export WK_IP_$N=$(doctl compute droplet get \
+        --format PublicIPv4 \
+        talos-demo-worker-$N \
+        | tail -1)
+    
+done
+
+
+# Set the endpoint and node of talosctl:
+talosctl --talosconfig talosconfig \
+    config endpoint $CP_IP_1 
 
 talosctl --talosconfig talosconfig \
-    config endpoint $CP_1_IP
+    config node $CP_IP_1
 
-talosctl --talosconfig talosconfig \
-    config node $CP_1_IP
+# Bootstrap etcd:
+talosctl --talosconfig talosconfig bootstrap
 
-talosctl --talosconfig talosconfig \
-    bootstrap
+# Retrieve the kubeconfig
+talosctl --talosconfig talosconfig kubeconfig .
 
-talosctl --talosconfig talosconfig \
-    kubeconfig kubeconfig.yaml
+kubectl --kubeconfig kubeconfig get nodes
 
-kubectl --kubeconfig kubeconfig.yaml \
-    get nodes
-
-# Orig: Start
-
-talosctl cluster create
-
-kubectl get nodes
-
-curl https://github.com/talos-systems/talos/releases/latest/download/talos-amd64.iso -L -o /home/alfadil/DevOps/talos/_out/talos-amd64.iso
-
-TALOS_LOC="/home/alfadil/DevOps/talos" 
-TALOS_ISO="/home/alfadil/DevOps/talos/_out/talos-amd64.iso"
-
-
-# prepare the kvm machines
-VM="k8s-master"
-IP_ADDRESS="192.168.122.20"
-MAC_ADDRESS="52:54:00:f2:d3:20" 
-
-virsh net-update --network default \
-     --command add-last --section ip-dhcp-host \
-     --xml "<host mac='${MAC_ADDRESS}' name='${VM}' ip='${IP_ADDRESS}'/>" \
-     --live --config
-
-virt-install --name ${VM} \
-     --ram 2048 --vcpus 2 --os-type linux --os-variant ubuntu20.04 \
-     --network bridge=virbr0,mac=${MAC_ADDRESS} \
-     --disk path=${TALOS_LOC}/${VM}.qcow2,size=20,device=disk,bus=scsi \
-     --cdrom ${TALOS_ISO} \
-     --console=pty,target.type=serial --graphics none --noautoconsole   
-
-
-
-VM="k8s-node1"
-IP_ADDRESS="192.168.122.21"
-MAC_ADDRESS="52:54:00:f2:d3:21" 
-
-virsh net-update --network default \
-     --command add-last --section ip-dhcp-host \
-     --xml "<host mac='${MAC_ADDRESS}' name='${VM}' ip='${IP_ADDRESS}'/>" \
-     --live --config
-
-virt-install --name ${VM} \
-     --ram 2048 --vcpus 2 --os-type linux --os-variant ubuntu20.04 \
-     --network bridge=virbr0,mac=${MAC_ADDRESS} \
-     --disk path=${TALOS_LOC}/${VM}.qcow2,size=20,device=disk,bus=scsi \
-     --cdrom ${TALOS_ISO} \
-     --console=pty,target.type=serial --graphics none --noautoconsole   
-
-
-VM="k8s-node2"
-IP_ADDRESS="192.168.122.22"
-MAC_ADDRESS="52:54:00:f2:d3:22" 
-
-virsh net-update --network default \
-    --command add-last --section ip-dhcp-host \
-    --xml "<host mac='${MAC_ADDRESS}' name='${VM}' ip='${IP_ADDRESS}'/>" \
-    --live --config
-
-virt-install --name ${VM} \
-     --ram 2048 --vcpus 2 --os-type linux --os-variant ubuntu20.04 \
-     --network bridge=virbr0,mac=${MAC_ADDRESS} \
-     --disk path=${TALOS_LOC}/${VM}.qcow2,size=20,device=disk,bus=scsi \
-     --cdrom ${TALOS_ISO} \
-     --console=pty,target.type=serial --graphics none --noautoconsole   
-
-
-#Generate the machine configurations to use for installing Talos and Kubernete
-talosctl gen config talos-virsh-cluster https://192.168.122.20:6443 --output-dir ${TALOS_LOC}/_outs
-
-
-
-
-
-talosctl apply-config --insecure --nodes 192.168.122.20 --file ${TALOS_LOC}/_outs/controlplane.yaml
-
-
-talosctl apply-config --insecure --nodes 192.168.122.21 --file ${TALOS_LOC}/_outs/worker.yaml
-
-talosctl apply-config --insecure --nodes 192.168.122.22 --file ${TALOS_LOC}/_outs/worker.yaml
-
-talosctl --talosconfig=${TALOS_LOC}/_outs/talosconfig config endpoint 192.168.122.20 192.168.122.21 192.168.122.22
-
-
-# give it time
-talosctl --talosconfig=${TALOS_LOC}/_outs/talosconfig --nodes 192.168.122.20 version
-
-
-talosctl config merge ${TALOS_LOC}/_outs/talosconfig
-
-talosctl bootstrap --nodes 192.168.122.20
-
-#Using the cluster
-export CONTROL_PLANE_IP=192.168.122.20
-talosctl config endpoint $CONTROL_PLANE_IP
-talosctl config node $CONTROL_PLANE_IP
-
-talosctl kubeconfig
-
-kubectl get nodes
-
-kubectl create deployment nginx --image=nginx
+kubectl --kubeconfig kubeconfig create deployment nginx --image=nginx
 
 # Orig: End
 
-# TODO: Demonstrate security
+# security
+# you simply cannot change anything on any of the nodes 
+# you cannot ssh to it so no way to install anything
+doctl compute ssh talos-demo-cp-2
 
-# TODO: Demonstrate predictability
+# this will always fail with
+# Error: fork/exec /usr/bin/ssh: permission denied
 
-# TODO: Demonstrate evolvability
+# predictability
+# just add a new worker node
+# or remove a node and the cluster just works
+
+doctl compute droplet create \                                                                                      at 22:08:01
+    --region $REGION \
+    --image $IMAGE_ID \
+    --size $WORKER_SIZE \
+    --enable-private-networking \
+    --user-data-file worker.yaml \
+    --ssh-keys $SSH_KEY_FINGERPRINT \
+    talos-demo-worker-4
+
+# evolvability
+# in term of upgrade the kublet version
+# you can easily do it by running
+
+talosctl --talosconfig talosconfig --nodes $CP_IP_2 upgrade-k8s --to 1.23.1
+
+# the current version being 1.23
+# it's this simple 
+
+
 
 ##############
 # Conclusion #
 ##############
 
-# Cons:
-# - TODO:
-
 # Pros:
-# - TODO:
+#   - A fast way to create a k8s cluster on many platforms.
+#   - Secure by design
+#   - No big maintenance overhead(you can't break it).
+
+# Cons:
+# - POOR documentation.
+# - Slow to start
 
 ###########
 # Destroy #
